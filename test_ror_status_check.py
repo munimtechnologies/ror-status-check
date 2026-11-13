@@ -27,6 +27,19 @@ PLOS = {"id": "https://ror.org/03bdvdc06", "status": "withdrawn",
         "names": [{"value": "Public Library of Science", "types": ["ror_display"]}],
         "relationships": [{"type": "successor", "id": "https://ror.org/008zgvp64",
                            "label": "Public Library of Science"}]}
+UTA = {"id": "https://ror.org/00hj54h04", "status": "active",
+       "names": [{"value": "The University of Texas at Austin", "types": ["ror_display"]}]}
+UTA_MATCH = {"number_of_results": 2, "items": [
+    {"substring": "The University of Texas at Austin", "score": 1.0,
+     "matching_type": "SINGLE SEARCH", "chosen": True, "organization": UTA},
+    {"substring": "The University of Texas at Austin", "score": 0.91,
+     "matching_type": "SINGLE SEARCH", "chosen": False,
+     "organization": {"id": "https://ror.org/019kgqr73", "status": "active",
+                      "names": [{"value": "The University of Texas at Arlington",
+                                 "types": ["ror_display"]}]}}]}
+NO_MATCH = {"number_of_results": 1, "items": [
+    {"substring": "Eodyn", "score": 0.5, "matching_type": "FUZZY", "chosen": False,
+     "organization": BROAD}]}
 
 DOI = "10.5281/zenodo.24183284"
 DATACITE_REC = {"data": {"id": DOI, "attributes": {"creators": [
@@ -36,6 +49,18 @@ DATACITE_REC = {"data": {"id": DOI, "attributes": {"creators": [
         {"name": "Harvard Medical School",
          "affiliationIdentifier": "https://ror.org/03wevmz92",
          "affiliationIdentifierScheme": "ROR"}]}]}}}
+EDMO_DOI = "10.5281/zenodo.999001"
+EDMO_REC = {"data": {"id": EDMO_DOI, "attributes": {"creators": [
+    {"name": "Ge, Tian", "affiliation": [
+        {"name": "Broad Institute", "affiliationIdentifier": "https://ror.org/05a0ya142",
+         "affiliationIdentifierScheme": "ROR"},
+        {"name": "Harvard Medical School",
+         "affiliationIdentifier": "https://ror.org/03wevmz92",
+         "affiliationIdentifierScheme": "ROR"}]},
+    {"name": "Ni, Yang", "affiliation": [
+        {"name": "The University of Texas at Austin",
+         "affiliationIdentifier": "edmo:4475",
+         "affiliationIdentifierScheme": "OTHER"}]}]}}}
 CROSSREF_REC = {"DOI": "10.53354/x", "author": [
     {"given": "Calum", "family": "MacRae", "affiliation": [
         {"id": [{"id": "https://ror.org/03wevmz92", "id-type": "ROR",
@@ -125,6 +150,37 @@ class TestExtract(unittest.TestCase):
         self.assertEqual([h["ror_id"] for h in hits], ["03wevmz92"])
 
 
+class TestExtractEdmo(unittest.TestCase):
+    def test_datacite_edmo(self):
+        hits = rsc.extract_edmo_json(EDMO_REC["data"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["edmo_id"], "edmo:4475")
+        self.assertEqual(hits[0]["path"],
+                         "attributes.creators[1].affiliation[0].affiliationIdentifier")
+        self.assertEqual(hits[0]["name_in_record"], "The University of Texas at Austin")
+
+    def test_invenio_edmo(self):
+        hits = rsc.extract_edmo_json(INVENIO_REC)
+        self.assertEqual([(h["edmo_id"], h["path"], h["name_in_record"]) for h in hits],
+                         [("edmo:3800", "metadata.creators[0].affiliations[1].id",
+                           "Harvard University")])
+
+    def test_no_name_from_parent(self):
+        hits = rsc.extract_edmo_json({"name": "Ge, Tian", "affiliation": ["edmo:3800"]})
+        self.assertEqual([(h["edmo_id"], h["name_in_record"]) for h in hits],
+                         [("edmo:3800", "")])
+
+    def test_text_forms(self):
+        text = ("see EDMO:0544 and https://edmo.seadatanet.org/report/3800\n"
+                "xedmo:1 notedmo:2 scheme EDMO edmo:12345678\n")
+        hits = rsc.extract_edmo_any(text)
+        self.assertEqual([h["edmo_id"] for h in hits], ["edmo:544", "edmo:3800"])
+        self.assertEqual([h["path"] for h in hits], ["line 1", "line 1"])
+
+    def test_ror_extraction_unchanged(self):
+        self.assertEqual(rsc.extract_any("edmo:3800\n"), [])
+
+
 class TestAdvice(unittest.TestCase):
     def test_parse_ror(self):
         self.assertEqual(rsc.parse_ror(HMS), {
@@ -144,19 +200,55 @@ class TestAdvice(unittest.TestCase):
         self.assertTrue(rsc.advise({"status": "malformed"})[0])
         self.assertFalse(rsc.advise({"status": "error", "error": "x"})[0])
 
+    def test_advise_edmo(self):
+        p, a = rsc.advise_edmo({"match": {"id": "00hj54h04",
+                                          "name": "The University of Texas at Austin"}})
+        self.assertTrue(p)
+        self.assertIn("https://ror.org/00hj54h04 (The University of Texas at Austin)", a)
+        self.assertFalse(rsc.advise_edmo({"match": None})[0])
+        self.assertIn("no organisation name", rsc.advise_edmo({"match": None,
+                                                              "no_name": True})[1])
+        self.assertIn("failed: x", rsc.advise_edmo({"match": None, "error": "x"})[1])
+
     def test_fix_text_whole_tokens(self):
         self.assertEqual(
             rsc.fix_text("x03wevmz92 03wevmz92 03WEVMZ92a", {"03wevmz92": "03vek6s52"}),
             ("x03wevmz92 03vek6s52 03WEVMZ92a", 1))
 
 
+class TestMatch(unittest.TestCase):
+    def test_match_chosen_and_cached(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", UTA_MATCH)])
+        c = rsc.Checker(get=get, pause=0)
+        m = c.match_ror("The University of Texas at Austin")
+        self.assertEqual(m["match"], {"id": "00hj54h04",
+                                      "name": "The University of Texas at Austin"})
+        c.match_ror("the university of texas at austin")
+        self.assertEqual(len(get.calls), 1)
+        self.assertIn("affiliation=The+University+of+Texas+at+Austin", get.calls[0])
+
+    def test_match_none_and_no_name(self):
+        c = rsc.Checker(get=fake_get([(rsc.ROR_API + "?affiliation=", NO_MATCH)]),
+                        pause=0)
+        self.assertIsNone(c.match_ror("Eodyn")["match"])
+        self.assertTrue(c.match_ror("  ")["no_name"])
+
+    def test_match_ignores_inactive(self):
+        gone = dict(UTA, status="withdrawn")
+        resp = {"items": [{"chosen": True, "organization": gone}]}
+        c = rsc.Checker(get=fake_get([(rsc.ROR_API + "?affiliation=", resp)]), pause=0)
+        self.assertIsNone(c.match_ror("The University of Texas at Austin")["match"])
+
+
 class TestMain(unittest.TestCase):
     def table(self):
         return [(rsc.DATACITE + "/" + DOI, DATACITE_REC),
+                (rsc.DATACITE + "/" + EDMO_DOI, EDMO_REC),
                 (rsc.CROSSREF + "/10.53354/x", {"message": CROSSREF_REC}),
                 (rsc.ROR_API + "/03wevmz92", HMS),
                 (rsc.ROR_API + "/03vek6s52", HARVARD),
-                (rsc.ROR_API + "/05a0ya142", BROAD)]
+                (rsc.ROR_API + "/05a0ya142", BROAD),
+                (rsc.ROR_API + "?affiliation=", UTA_MATCH)]
 
     def test_doi_datacite_text(self):
         out = io.StringIO()
@@ -168,6 +260,62 @@ class TestMain(unittest.TestCase):
         self.assertIn("03vek6s52 (Harvard University)", s)
         self.assertIn("1 withdrawn, 0 unknown, 0 malformed, 1 active", s)
         self.assertNotIn("05a0ya142", s)
+        self.assertNotIn("EDMO", s)
+
+    def test_doi_with_edmo(self):
+        get = fake_get(self.table())
+        out = io.StringIO()
+        code = rsc.main(["--pause", "0", EDMO_DOI], get=get, out=out)
+        s = out.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("edmo:4475 \"The University of Texas at Austin\"  EDMO", s)
+        self.assertIn("https://ror.org/00hj54h04 (The University of Texas at Austin)", s)
+        self.assertIn("Checked 2 ROR ID mentions (2 distinct) in 1 source(s): "
+                      "1 withdrawn, 0 unknown, 0 malformed, 1 active. "
+                      "Also 1 EDMO ID mention(s), 1 with a ROR match.", s)
+        self.assertEqual(sum(u.startswith(rsc.ROR_API + "?affiliation=")
+                             for u in get.calls), 1)
+
+    def test_no_edmo_flag(self):
+        get = fake_get(self.table())
+        out = io.StringIO()
+        rsc.main(["--pause", "0", "--no-edmo", EDMO_DOI], get=get, out=out)
+        self.assertNotIn("EDMO", out.getvalue())
+        self.assertFalse(any(u.startswith(rsc.ROR_API + "?affiliation=")
+                             for u in get.calls))
+
+    def test_edmo_csv_columns(self):
+        out = io.StringIO()
+        rsc.main(["--pause", "0", "--csv", EDMO_DOI], get=fake_get(self.table()), out=out)
+        rows = list(csv.DictReader(io.StringIO(out.getvalue())))
+        e = [r for r in rows if r["status"] == "edmo"]
+        self.assertEqual(len(e), 1)
+        self.assertEqual((e[0]["edmo_id"], e[0]["ror_match"], e[0]["problem"]),
+                         ("edmo:4475", "00hj54h04", "True"))
+
+    def test_edmo_without_match_exit_0(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", NO_MATCH)])
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "rec.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"affiliations": [{"id": "edmo:6246", "name": "Eodyn"}]}, f)
+            out = io.StringIO()
+            code = rsc.main([p, "--pause", "0"], get=get, out=out)
+        self.assertEqual(code, 0)
+        self.assertIn("no confident match", out.getvalue())
+        self.assertIn("Also 1 EDMO ID mention(s), 0 with a ROR match.", out.getvalue())
+
+    def test_edmo_match_error_exit_2(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", RuntimeError("boom"))])
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "rec.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"affiliations": [{"id": "edmo:3800",
+                                             "name": "Harvard University"}]}, f)
+            out = io.StringIO()
+            code = rsc.main([p, "--pause", "0"], get=get, out=out)
+        self.assertEqual(code, 2)
+        self.assertIn("ROR name match failed: boom", out.getvalue())
 
     def test_doi_crossref_json(self):
         out = io.StringIO()
@@ -236,7 +384,9 @@ class TestMain(unittest.TestCase):
 
 class TestRepository(unittest.TestCase):
     def table(self):
-        return [(rsc.ROR_API + "?filter=status:withdrawn&page=1",
+        return [(lambda u: u.startswith(rsc.DATACITE + "?") and "edmo" in u,
+                 {"meta": {"total": 80195}, "data": []}),
+                (rsc.ROR_API + "?filter=status:withdrawn&page=1",
                  {"number_of_results": 2, "items": [HMS, PLOS]}),
                 (lambda u: u.startswith(rsc.DATACITE + "?") and "03wevmz92" in u,
                  {"meta": {"total": 1065},
@@ -254,6 +404,22 @@ class TestRepository(unittest.TestCase):
         self.assertIn("replace with https://ror.org/03vek6s52 (Harvard University)",
                       r["advice"])
         self.assertTrue(any("client-id=cern.zenodo" in u for u in get.calls))
+
+    def test_edmo_count(self):
+        get = fake_get(self.table())
+        n = rsc.edmo_count(rsc.Checker(get=get, pause=0), "cern.zenodo")
+        self.assertEqual(n, 80195)
+        self.assertIn("client-id=cern.zenodo", get.calls[0])
+        self.assertIn("edmo%2A", get.calls[0])
+
+    def test_main_scan_text_with_edmo_line(self):
+        out = io.StringIO()
+        code = rsc.main(["--datacite-client", "cern.zenodo", "--pause", "0"],
+                        get=fake_get(self.table()), out=out)
+        s = out.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("1 withdrawn ROR IDs in use, on 1065 ID-DOI pairs.", s)
+        self.assertIn("80195 DOIs in datacite:cern.zenodo carry an EDMO affiliation ID", s)
 
     def test_withdrawn_list(self):
         out = io.StringIO()

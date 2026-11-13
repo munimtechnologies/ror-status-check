@@ -12,19 +12,26 @@ ROR dump keep offering withdrawn records in their affiliation pickers, so new
 DOIs keep getting them (Harvard Medical School, https://ror.org/03wevmz92, is
 on more than 1,200 DataCite DOIs).
 
+Since 0.2.0 it also flags EDMO affiliation IDs ("edmo:3800"). InvenioRDM
+sites such as Zenodo import the European Directory of Marine Organisations
+next to ROR, so a picker can offer an EDMO copy of a university right under
+its ROR record; DOIs that carry only the EDMO ID are missed by searches and
+counts that go by ROR ID. For each EDMO ID the checker asks ROR's affiliation
+matcher for a confident match on the name in the record and suggests it.
+
 This script checks:
   * DOIs (Crossref or DataCite metadata, fetched live),
   * local files (JSON such as InvenioRDM/Zenodo records, DataCite or Crossref
     JSON, JSON lines; any other text such as XML or CSV is scanned for
-    ror.org/... links),
+    ror.org/... links and edmo:... IDs),
   * a whole DataCite repository (--datacite-client) or Crossref member
     (--crossref-member), one query per withdrawn ROR record.
 
 For every ROR ID found it reports the ROR status and what to do: withdrawn ->
 replace with the successor; inactive -> keep (ROR advises keeping historical
 IDs in DOI metadata); unknown (404) or malformed (bad checksum) -> fix the
-typo. Exit code 1 if any withdrawn, unknown or malformed ID is found, 2 if a
-lookup failed, else 0.
+typo. Exit code 1 if any withdrawn, unknown or malformed ROR ID, or any EDMO ID
+with a confident ROR match, is found; 2 if a lookup failed; else 0.
 """
 import argparse
 import csv
@@ -38,7 +45,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MAILTO = "mv2@munimtech.com"
 UA = "ror-status-check/%s (MV2, Munim, Inc.; mailto:%s)" % (VERSION, MAILTO)
 ROR_API = "https://api.ror.org/v2/organizations"
@@ -50,6 +57,8 @@ URL_RE = re.compile(r"ror\.org/(0[0-9a-z]{4,12})(?![0-9a-z])", re.I)
 BARE_RE = re.compile(r"^\s*0[0-9a-z]{6}[0-9]{2}\s*$", re.I)
 WELL_FORMED_RE = re.compile(r"0[0-9a-hjkmnp-tv-z]{6}[0-9]{2}")
 DOI_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:)?(10\.\d{4,9}/\S+)$", re.I)
+EDMO_RE = re.compile(r"(?<![0-9a-z])edmo(?::|\.seadatanet\.org/report/)(\d{1,6})(?![0-9])",
+                     re.I)
 SCHEME_KEYS = ("scheme", "identifierscheme", "affiliationidentifierscheme",
                "nameidentifierscheme", "funderidentifiertype", "id-type")
 ID_KEYS = ("id", "identifier", "affiliationidentifier", "funderidentifier",
@@ -59,7 +68,7 @@ ORG_PATH_WORDS = ("affiliation", "funder", "organization", "organisation",
 NAME_KEYS = ("name", "funderName", "label")
 PROBLEMS = ("withdrawn", "unknown", "malformed")
 FIELDS = ["source", "path", "ror_id", "status", "name_in_record", "ror_name",
-          "successors", "problem", "advice"]
+          "successors", "problem", "advice", "edmo_id", "ror_match"]
 
 
 # ------------------------------------------------------------------ ID rules
@@ -160,23 +169,85 @@ def extract_text(text):
     return out
 
 
-def extract_any(text):
-    """JSON document, JSON lines, or plain text (XML, CSV, ...)."""
+def _parse_any(text):
+    """('json', value) / ('jsonl', [(line_no, value), ...]) / ('text', None)."""
     try:
-        return extract_json(json.loads(text))
+        return "json", json.loads(text)
     except ValueError:
         pass
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    if lines:
-        out = []
+    if any(ln.strip() for ln in text.splitlines()):
+        vals = []
         try:
             for i, ln in enumerate(text.splitlines(), 1):
                 if ln.strip():
-                    extract_json(json.loads(ln), "line %d" % i, "", out)
-            return out
+                    vals.append((i, json.loads(ln)))
+            return "jsonl", vals
         except ValueError:
             pass
+    return "text", None
+
+
+def extract_any(text):
+    """JSON document, JSON lines, or plain text (XML, CSV, ...)."""
+    kind, val = _parse_any(text)
+    if kind == "json":
+        return extract_json(val)
+    if kind == "jsonl":
+        out = []
+        for i, v in val:
+            extract_json(v, "line %d" % i, "", out)
+        return out
     return extract_text(text)
+
+
+# ------------------------------------------------------------ EDMO extraction
+
+def _edmo_from_string(s, path, name, out):
+    for m in EDMO_RE.finditer(s):
+        out.append({"path": path, "raw": m.group(0),
+                    "edmo_id": "edmo:%d" % int(m.group(1)),
+                    "name_in_record": name or ""})
+
+
+def extract_edmo_json(obj, path="", out=None):
+    """All EDMO IDs ('edmo:3800', 'edmo.seadatanet.org/report/3800') in a JSON
+    value. The name is taken only from the same object (an affiliation's own
+    'name'), never from a parent such as the creator, so a person's name is
+    never sent to the ROR matcher."""
+    if out is None:
+        out = []
+    if isinstance(obj, str):
+        _edmo_from_string(obj, path or "value", "", out)
+    elif isinstance(obj, dict):
+        name = _ctx_name(obj, "")
+        for k, v in obj.items():
+            p = "%s.%s" % (path, k) if path else str(k)
+            if isinstance(v, str):
+                _edmo_from_string(v, p, name, out)
+            else:
+                extract_edmo_json(v, p, out)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            p = "%s[%d]" % (path, i)
+            if isinstance(v, str):
+                _edmo_from_string(v, p, "", out)
+            else:
+                extract_edmo_json(v, p, out)
+    return out
+
+
+def extract_edmo_any(text):
+    kind, val = _parse_any(text)
+    if kind == "json":
+        return extract_edmo_json(val)
+    out = []
+    if kind == "jsonl":
+        for i, v in val:
+            extract_edmo_json(v, "line %d" % i, out)
+        return out
+    for ln, line in enumerate(text.splitlines(), 1):
+        _edmo_from_string(line, "line %d" % ln, "", out)
+    return out
 
 
 # ------------------------------------------------------------------- lookups
@@ -225,6 +296,22 @@ def advise(info):
     if s == "malformed":
         return True, "not a valid ROR ID (format or checksum fails); check for a typo"
     return False, "lookup failed: " + str(info.get("error") or s)
+
+
+def advise_edmo(match):
+    """(is_problem, advice) for an EDMO ID, given the ROR matcher's result."""
+    twin = match.get("match")
+    if twin:
+        return True, ("EDMO ID, not ROR; ROR's affiliation matcher picks "
+                      "https://ror.org/%s (%s) for this name. If it is the same "
+                      "organisation, use the ROR ID so ROR-based searches and counts "
+                      "find this record" % (twin["id"], twin["name"]))
+    if match.get("error"):
+        return False, "EDMO ID, not ROR; ROR name match failed: " + match["error"]
+    if match.get("no_name"):
+        return False, "EDMO ID, not ROR; no organisation name next to it to match"
+    return False, ("EDMO ID, not ROR; ROR's matcher has no confident match for this "
+                   "name (normal for a marine organisation without a ROR record)")
 
 
 def http_get(url, tries=5):
@@ -278,6 +365,30 @@ class Checker:
         self.cache[rid] = info
         return info
 
+    def match_ror(self, name):
+        """ROR's affiliation matcher: the 'chosen' active record for a name."""
+        name = (name or "").strip()
+        if not name:
+            return {"match": None, "no_name": True}
+        key = "affiliation:" + name.lower()
+        if key in self.cache:
+            return self.cache[key]
+        res = {"match": None}
+        try:
+            d = self.fetch(ROR_API + "?" + urllib.parse.urlencode({"affiliation": name}))
+            for it in (d or {}).get("items") or []:
+                if it.get("chosen"):
+                    org = it.get("organization") or {}
+                    info = parse_ror(org)
+                    rid = normalize_id(org.get("id"))
+                    if rid and info["status"] == "active":
+                        res = {"match": {"id": rid, "name": info["ror_name"]}}
+                    break
+        except Exception as e:  # reported per ID, exit code 2
+            res = {"match": None, "error": str(e)[:200]}
+        self.cache[key] = res
+        return res
+
     def fetch_doi(self, doi):
         q = urllib.parse.quote(doi, safe="/")
         d = self.fetch("%s/%s?mailto=%s" % (CROSSREF, q, MAILTO))
@@ -299,6 +410,21 @@ class Checker:
                          "ror_name": info.get("ror_name", ""),
                          "successors": info.get("successors") or [],
                          "problem": problem, "advice": adv})
+        return rows
+
+    def check_edmo_hits(self, source, hits):
+        rows = []
+        for h in hits:
+            m = self.match_ror(h["name_in_record"])
+            problem, adv = advise_edmo(m)
+            twin = m.get("match")
+            rows.append({"source": source, "path": h["path"], "ror_id": "",
+                         "edmo_id": h["edmo_id"], "raw": h["raw"], "status": "edmo",
+                         "name_in_record": h["name_in_record"],
+                         "ror_name": twin["name"] if twin else "",
+                         "ror_match": twin["id"] if twin else "",
+                         "successors": [], "problem": problem, "advice": adv,
+                         "lookup_failed": bool(m.get("error"))})
         return rows
 
     def list_withdrawn(self):
@@ -323,6 +449,18 @@ def datacite_query(rid):
               "contributors.affiliation.affiliationIdentifier",
               "fundingReferences.funderIdentifier")
     return " OR ".join('%s:"%s"' % (f, u) for f in fields)
+
+
+EDMO_QUERY = ("creators.affiliation.affiliationIdentifier:edmo* OR "
+              "contributors.affiliation.affiliationIdentifier:edmo*")
+
+
+def edmo_count(checker, client):
+    """Number of DOIs in a DataCite client with an EDMO affiliation ID."""
+    p = urllib.parse.urlencode({"query": EDMO_QUERY, "client-id": client,
+                                "page[size]": 0}, safe=":,")
+    d = checker.fetch(DATACITE + "?" + p) or {}
+    return int((d.get("meta") or {}).get("total") or 0)
 
 
 def scan_repository(checker, client=None, member=None, examples=3, limit=0,
@@ -391,13 +529,19 @@ def _succ_str(succ):
 
 
 def summary_line(rows, n_sources):
+    ror_rows = [r for r in rows if r["status"] != "edmo"]
+    edmo_rows = [r for r in rows if r["status"] == "edmo"]
     c = {}
-    for r in rows:
+    for r in ror_rows:
         c[r["status"]] = c.get(r["status"], 0) + 1
     order = ["withdrawn", "unknown", "malformed", "inactive", "active", "error"]
     parts = ["%d %s" % (c.get(k, 0), k) for k in order if c.get(k) or k in PROBLEMS]
-    return "Checked %d ROR ID mentions (%d distinct) in %d source(s): %s." % (
-        len(rows), len({r["ror_id"] for r in rows}), n_sources, ", ".join(parts))
+    s = "Checked %d ROR ID mentions (%d distinct) in %d source(s): %s." % (
+        len(ror_rows), len({r["ror_id"] for r in ror_rows}), n_sources, ", ".join(parts))
+    if edmo_rows:
+        s += " Also %d EDMO ID mention(s), %d with a ROR match." % (
+            len(edmo_rows), sum(1 for r in edmo_rows if r.get("ror_match")))
+    return s
 
 
 def render_text(rows, n_sources, show_all=False, notes=()):
@@ -410,7 +554,10 @@ def render_text(rows, n_sources, show_all=False, notes=()):
             buf.write("%s\n" % r["source"])
             last = r["source"]
         nm = (' "%s"' % r["name_in_record"]) if r["name_in_record"] else ""
-        rid = ("https://ror.org/" + r["ror_id"]) if r["ror_id"] else "(no ID)"
+        if r["status"] == "edmo":
+            rid = r.get("edmo_id") or "(no ID)"
+        else:
+            rid = ("https://ror.org/" + r["ror_id"]) if r["ror_id"] else "(no ID)"
         buf.write("  %s\n    %s%s  %s\n    -> %s\n" % (
             r["path"], rid, nm, r["status"].upper(), r["advice"]))
     for n in notes:
@@ -436,7 +583,7 @@ def render_csv(rows, fields):
 def exit_code(rows):
     if any(r.get("problem") for r in rows):
         return 1
-    if any(r.get("status") == "error" for r in rows):
+    if any(r.get("status") == "error" or r.get("lookup_failed") for r in rows):
         return 2
     return 0
 
@@ -451,7 +598,7 @@ def load_inputs(args, doi_file):
     return items
 
 
-def check_inputs(checker, items, read_stdin=None):
+def check_inputs(checker, items, read_stdin=None, edmo=True):
     rows, notes, n_sources = [], [], 0
     for arg in items:
         m = DOI_RE.match(arg)
@@ -470,7 +617,10 @@ def check_inputs(checker, items, read_stdin=None):
             if rec is None:
                 notes.append("doi:%s: not found in Crossref or DataCite" % doi)
                 continue
-            rows += checker.check_hits("doi:%s (%s)" % (doi, agency), extract_json(rec))
+            src = "doi:%s (%s)" % (doi, agency)
+            rows += checker.check_hits(src, extract_json(rec))
+            if edmo:
+                rows += checker.check_edmo_hits(src, extract_edmo_json(rec))
             continue
         if arg == "-":
             text = (read_stdin or sys.stdin.read)()
@@ -479,6 +629,8 @@ def check_inputs(checker, items, read_stdin=None):
                 text = f.read()
         n_sources += 1
         rows += checker.check_hits(arg, extract_any(text))
+        if edmo:
+            rows += checker.check_edmo_hits(arg, extract_edmo_any(text))
     return rows, notes, n_sources
 
 
@@ -486,8 +638,8 @@ def main(argv=None, get=None, out=None):
     out = out or sys.stdout
     ap = argparse.ArgumentParser(
         prog="ror_status_check",
-        description="Find withdrawn, unknown or malformed ROR IDs in DOIs, "
-                    "metadata files or whole repositories.")
+        description="Find withdrawn, unknown or malformed ROR IDs (and EDMO IDs that "
+                    "have a ROR twin) in DOIs, metadata files or whole repositories.")
     ap.add_argument("inputs", nargs="*",
                     help="DOIs (10.x/..., doi:..., https://doi.org/...), files, or - for stdin")
     ap.add_argument("--doi-file", help="file with one DOI or path per line")
@@ -501,6 +653,8 @@ def main(argv=None, get=None, out=None):
                     help="scan only the first N withdrawn IDs (testing)")
     ap.add_argument("--fix-to", help="with one local file: write a copy with each "
                     "withdrawn ID that has exactly one successor replaced by it")
+    ap.add_argument("--no-edmo", action="store_true",
+                    help="do not look for EDMO affiliation IDs")
     ap.add_argument("--all", action="store_true", help="also list active IDs")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--csv", action="store_true")
@@ -535,13 +689,18 @@ def main(argv=None, get=None, out=None):
                     ", ".join(r["examples"]), r["advice"]))
             out.write("%d withdrawn ROR IDs in use, on %d ID-DOI pairs.\n" % (
                 len(rows), sum(r["dois"] for r in rows)))
+            if a.datacite_client and not a.no_edmo:
+                n = edmo_count(checker, a.datacite_client)
+                out.write("%d DOIs in datacite:%s carry an EDMO affiliation ID "
+                          "(edmo:...); check them one by one to see which have a ROR "
+                          "twin.\n" % (n, a.datacite_client))
         return 1 if rows else 0
 
     items = load_inputs(a.inputs, a.doi_file)
     if not items:
         ap.error("give DOIs, files, --doi-file, --datacite-client, "
                  "--crossref-member or --withdrawn-list")
-    rows, notes, n_sources = check_inputs(checker, items)
+    rows, notes, n_sources = check_inputs(checker, items, edmo=not a.no_edmo)
 
     if a.fix_to:
         local = [x for x in items if os.path.exists(x)]
