@@ -43,13 +43,15 @@ python ror_status_check.py --json ...                       # structured output
 ```
 
 Exit code 1 means a withdrawn, unknown (404) or malformed (checksum fails) ROR ID, or an
-EDMO ID whose name ROR's affiliation matcher confidently maps to a ROR record, was found.
-Show the user each finding's `path`, `ror_id` or `edmo_id`, `status` and `advice`. For a
-withdrawn ID with one successor, offer `--fix-to`; with several successors or none, ask
-the user which organisation is meant. For an EDMO ID, show the suggested `ror_match`
-and let the user confirm it is the same organisation (the matcher goes by name only;
-`--fix-to` never changes EDMO IDs). Do not suggest replacing `inactive` IDs in
-published metadata.
+EDMO ID with a checked ROR match, was found. Show the user each finding's `path`,
+`ror_id` or `edmo_id`, `status` and `advice`. For a withdrawn ID with one successor,
+offer `--fix-to`; with several successors or none, ask the user which organisation is
+meant. For an EDMO ID, show the suggested `ror_match` and its `match_basis` (`chosen`:
+ROR's matcher picked it and the name and country agree; `name+country`: the only
+same-name ROR record in the EDMO entry's country) and let the user confirm it is the
+same organisation; a department may be matched to its university. A `ror_candidate`
+was rejected by the name or country check: do not suggest it. `--fix-to` never changes
+EDMO IDs. Do not suggest replacing `inactive` IDs in published metadata.
 
 ## Rules for the agent
 
@@ -59,7 +61,8 @@ published metadata.
   the IDs are not changed; point that out.
 - Changing registered DOI metadata is the depositor's decision. Do not contact
   repositories or publishers on the user's behalf.
-- Requests are read-only (api.ror.org, api.crossref.org, api.datacite.org). Only the
+- Requests are read-only (api.ror.org, api.crossref.org, api.datacite.org, and
+  zenodo.org's affiliation vocabulary for an EDMO entry's country). Only the
   organisation name stored next to an EDMO ID is sent to ROR's matcher, never a person's
   name. A repository scan makes about 1,450 requests; do not run scans in loops.
 

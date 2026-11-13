@@ -17,7 +17,16 @@ sites such as Zenodo import the European Directory of Marine Organisations
 next to ROR, so a picker can offer an EDMO copy of a university right under
 its ROR record; DOIs that carry only the EDMO ID are missed by searches and
 counts that go by ROR ID. For each EDMO ID the checker asks ROR's affiliation
-matcher for a confident match on the name in the record and suggests it.
+matcher about the name in the record.
+
+Since 0.2.1 a suggestion must also pass two checks, because ROR's matcher
+goes by name alone: the ROR record's names must share most of their words
+with the name in the record (ROR's matcher once picked a US company for
+"Barcelona Tech. Laboratory of Maritime Engineering"), and its country must
+equal the EDMO entry's country in Zenodo's vocabulary. When the matcher
+picks nothing (several organisations are called "National Research
+Council"), a single same-name record in the EDMO entry's country is
+suggested instead.
 
 This script checks:
   * DOIs (Crossref or DataCite metadata, fetched live),
@@ -31,7 +40,7 @@ For every ROR ID found it reports the ROR status and what to do: withdrawn ->
 replace with the successor; inactive -> keep (ROR advises keeping historical
 IDs in DOI metadata); unknown (404) or malformed (bad checksum) -> fix the
 typo. Exit code 1 if any withdrawn, unknown or malformed ROR ID, or any EDMO ID
-with a confident ROR match, is found; 2 if a lookup failed; else 0.
+with a checked ROR match, is found; 2 if a lookup failed; else 0.
 """
 import argparse
 import csv
@@ -41,16 +50,18 @@ import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 MAILTO = "mv2@munimtech.com"
 UA = "ror-status-check/%s (MV2, Munim, Inc.; mailto:%s)" % (VERSION, MAILTO)
 ROR_API = "https://api.ror.org/v2/organizations"
 CROSSREF = "https://api.crossref.org/works"
 DATACITE = "https://api.datacite.org/dois"
+ZENODO_AFF = "https://zenodo.org/api/affiliations/"
 CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz"
 
 URL_RE = re.compile(r"ror\.org/(0[0-9a-z]{4,12})(?![0-9a-z])", re.I)
@@ -68,7 +79,15 @@ ORG_PATH_WORDS = ("affiliation", "funder", "organization", "organisation",
 NAME_KEYS = ("name", "funderName", "label")
 PROBLEMS = ("withdrawn", "unknown", "malformed")
 FIELDS = ["source", "path", "ror_id", "status", "name_in_record", "ror_name",
-          "successors", "problem", "advice", "edmo_id", "ror_match"]
+          "successors", "problem", "advice", "edmo_id", "ror_match", "match_basis",
+          "ror_candidate"]
+
+# Words ignored when comparing organisation names.
+STOP_WORDS = frozenset(
+    "the of and for at in on a an de la le les du des der die das und di del della "
+    "y e et van von".split())
+NAME_SHARE = 0.6        # share of a ROR name's words that must be in the record name
+ALT_MIN_SCORE = 0.9     # ROR matcher score needed for a same-country fallback
 
 
 # ------------------------------------------------------------------ ID rules
@@ -95,6 +114,71 @@ def normalize_id(x):
     if m:
         return m.group(1).lower()
     return x.lower() if BARE_RE.match(x) else ""
+
+
+# ------------------------------------------------------------- name checking
+
+def name_words(s):
+    """Lower-case words of a name, accents removed ('Université' -> 'universite')."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.findall(r"[^\W_]+", s.lower())
+
+
+def name_ok(record_name, ror_names, acronyms=()):
+    """True if a ROR record plausibly has the name stored in the record.
+
+    For at least one ROR name (display name, label or alias; text in
+    parentheses such as '(United Kingdom)' is dropped), at least NAME_SHARE of
+    its words other than STOP_WORDS appear in the record name. A ROR acronym
+    counts only if it is the whole record name. A department name such as
+    'University of Glasgow School of Life Sciences' passes for its university.
+    """
+    words = name_words(record_name)
+    if not words:
+        return False
+    whole = " ".join(words)
+    for a in acronyms or ():
+        if name_words(a) and " ".join(name_words(a)) == whole:
+            return True
+    rec = set(w for w in words if w not in STOP_WORDS)
+    for n in ror_names or ():
+        sig = set(w for w in name_words(re.sub(r"\([^)]*\)", " ", n or ""))
+                  if w not in STOP_WORDS)
+        if sig and len(sig & rec) >= NAME_SHARE * len(sig):
+            return True
+    return False
+
+
+def ror_names(org):
+    """(names, acronyms) of a ROR record (API v2, with a v1 fallback)."""
+    names, acr = [], []
+    for n in org.get("names") or []:
+        v = (n.get("value") or "").strip()
+        if not v:
+            continue
+        (acr if "acronym" in (n.get("types") or []) else names).append(v)
+    if isinstance(org.get("name"), str) and org["name"].strip():      # API v1
+        names.append(org["name"].strip())
+    for k in ("aliases", "acronyms"):                                  # API v1
+        for v in org.get(k) or []:
+            if isinstance(v, str) and v.strip():
+                (acr if k == "acronyms" else names).append(v.strip())
+    return names, acr
+
+
+def ror_countries(org):
+    """Set of ISO country codes of a ROR record's locations."""
+    out = set()
+    for loc in org.get("locations") or []:
+        cc = ((loc.get("geonames_details") or {}).get("country_code") or "").strip()
+        if cc:
+            out.add(cc.upper())
+    cc = ((org.get("country") or {}).get("country_code") or "").strip() \
+        if isinstance(org.get("country"), dict) else ""                # API v1
+    if cc:
+        out.add(cc.upper())
+    return out
 
 
 # ---------------------------------------------------------------- extraction
@@ -299,9 +383,15 @@ def advise(info):
 
 
 def advise_edmo(match):
-    """(is_problem, advice) for an EDMO ID, given the ROR matcher's result."""
+    """(is_problem, advice) for an EDMO ID, given the result of match_ror."""
     twin = match.get("match")
     if twin:
+        if match.get("basis") == "name+country":
+            return True, ("EDMO ID, not ROR; ROR has one record with this name in the "
+                          "same country (%s): https://ror.org/%s (%s). If it is the same "
+                          "organisation, use the ROR ID so ROR-based searches and counts "
+                          "find this record" % (match.get("country") or "?", twin["id"],
+                                                twin["name"]))
         return True, ("EDMO ID, not ROR; ROR's affiliation matcher picks "
                       "https://ror.org/%s (%s) for this name. If it is the same "
                       "organisation, use the ROR ID so ROR-based searches and counts "
@@ -310,6 +400,18 @@ def advise_edmo(match):
         return False, "EDMO ID, not ROR; ROR name match failed: " + match["error"]
     if match.get("no_name"):
         return False, "EDMO ID, not ROR; no organisation name next to it to match"
+    cand = match.get("candidate")
+    if cand and match.get("reason") == "name":
+        return False, ("EDMO ID, not ROR; ROR's matcher picks https://ror.org/%s (%s), "
+                       "but that name shares too few words with the name in the record, "
+                       "so no change is suggested; check by hand" % (cand["id"],
+                                                                     cand["name"]))
+    if cand and match.get("reason") == "country":
+        return False, ("EDMO ID, not ROR; ROR's matcher picks https://ror.org/%s (%s, %s), "
+                       "but this EDMO entry is in %s, so no change is suggested; check by "
+                       "hand" % (cand["id"], cand["name"],
+                                 "/".join(match.get("ror_countries") or []) or "?",
+                                 match.get("edmo_country") or "?"))
     return False, ("EDMO ID, not ROR; ROR's matcher has no confident match for this "
                    "name (normal for a marine organisation without a ROR record)")
 
@@ -337,9 +439,10 @@ def http_get(url, tries=5):
 
 
 class Checker:
-    def __init__(self, get=None, pause=0.1):
+    def __init__(self, get=None, pause=0.1, edmo_vocab=ZENODO_AFF):
         self.get = get or http_get
         self.pause = pause
+        self.edmo_vocab = edmo_vocab or ""
         self.cache = {}
 
     def fetch(self, url):
@@ -365,29 +468,109 @@ class Checker:
         self.cache[rid] = info
         return info
 
-    def match_ror(self, name):
-        """ROR's affiliation matcher: the 'chosen' active record for a name."""
-        name = (name or "").strip()
-        if not name:
-            return {"match": None, "no_name": True}
+    def affiliation(self, name):
+        """ROR's affiliation matcher for a name: {'items': [...]} or {'error': ...}.
+
+        Each item: id, name, active, chosen, score, names, acronyms, countries.
+        """
         key = "affiliation:" + name.lower()
         if key in self.cache:
             return self.cache[key]
-        res = {"match": None}
         try:
             d = self.fetch(ROR_API + "?" + urllib.parse.urlencode({"affiliation": name}))
+            items = []
             for it in (d or {}).get("items") or []:
-                if it.get("chosen"):
-                    org = it.get("organization") or {}
-                    info = parse_ror(org)
-                    rid = normalize_id(org.get("id"))
-                    if rid and info["status"] == "active":
-                        res = {"match": {"id": rid, "name": info["ror_name"]}}
-                    break
+                org = it.get("organization") or {}
+                info = parse_ror(org)
+                rid = normalize_id(org.get("id"))
+                if not rid:
+                    continue
+                names, acr = ror_names(org)
+                try:
+                    score = float(it.get("score") or 0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                items.append({"id": rid, "name": info["ror_name"],
+                              "active": info["status"] == "active",
+                              "chosen": bool(it.get("chosen")), "score": score,
+                              "names": names or [info["ror_name"]], "acronyms": acr,
+                              "countries": ror_countries(org)})
+            res = {"items": items}
         except Exception as e:  # reported per ID, exit code 2
-            res = {"match": None, "error": str(e)[:200]}
+            res = {"error": str(e)[:200]}
         self.cache[key] = res
         return res
+
+    def edmo_country(self, edmo_id):
+        """Country code of an EDMO entry in an InvenioRDM vocabulary (Zenodo's by
+        default), or '' if unknown. Never raises."""
+        if not edmo_id or not self.edmo_vocab:
+            return ""
+        key = "edmo-country:" + edmo_id
+        if key in self.cache:
+            return self.cache[key]
+        cc = ""
+        try:
+            d = self.fetch(self.edmo_vocab + urllib.parse.quote(edmo_id, safe=":"))
+            cc = str((d or {}).get("country") or "").strip().upper()
+            if not re.fullmatch(r"[A-Z]{2}", cc):
+                cc = ""
+        except Exception:
+            cc = ""
+        self.cache[key] = cc
+        return cc
+
+    def match_ror(self, name, edmo_id=""):
+        """A checked ROR record for the organisation name next to an EDMO ID.
+
+        1. ROR's 'chosen' record, if active, if name_ok and, when both countries
+           are known, in the EDMO entry's country (basis 'chosen').
+        2. Otherwise, if the EDMO entry's country is known: the only active
+           record with score >= ALT_MIN_SCORE, name_ok and that country
+           (basis 'name+country').
+        3. Otherwise no match; a rejected chosen record is returned as
+           'candidate' with the reason ('name' or 'country').
+        """
+        name = (name or "").strip()
+        if not name:
+            return {"match": None, "no_name": True}
+        aff = self.affiliation(name)
+        if "error" in aff:
+            return {"match": None, "error": aff["error"]}
+        items = aff["items"]
+        chosen = next((it for it in items if it["chosen"]), None)
+        if chosen and not chosen["active"]:
+            chosen = None
+        cc = self.edmo_country(edmo_id) if (edmo_id and items) else ""
+        rejected = None
+        if chosen:
+            if not name_ok(name, chosen["names"], chosen["acronyms"]):
+                rejected = (chosen, "name")
+            elif cc and chosen["countries"] and cc not in chosen["countries"]:
+                rejected = (chosen, "country")
+            else:
+                return {"match": {"id": chosen["id"], "name": chosen["name"]},
+                        "basis": "chosen"}
+        if cc:
+            alts = {}
+            for it in items:
+                if it["active"] and it["score"] >= ALT_MIN_SCORE \
+                        and cc in it["countries"] \
+                        and name_ok(name, it["names"], it["acronyms"]):
+                    alts[it["id"]] = it
+            if len(alts) == 1:
+                it = list(alts.values())[0]
+                return {"match": {"id": it["id"], "name": it["name"]},
+                        "basis": "name+country", "country": cc}
+        if rejected:
+            it, why = rejected
+            res = {"match": None, "candidate": {"id": it["id"], "name": it["name"]},
+                   "reason": why}
+            if why == "country":
+                res["edmo_country"] = cc
+                res["ror_countries"] = sorted(it["countries"])
+            return res
+        return {"match": None}
 
     def fetch_doi(self, doi):
         q = urllib.parse.quote(doi, safe="/")
@@ -415,14 +598,17 @@ class Checker:
     def check_edmo_hits(self, source, hits):
         rows = []
         for h in hits:
-            m = self.match_ror(h["name_in_record"])
+            m = self.match_ror(h["name_in_record"], h["edmo_id"])
             problem, adv = advise_edmo(m)
             twin = m.get("match")
+            cand = m.get("candidate")
             rows.append({"source": source, "path": h["path"], "ror_id": "",
                          "edmo_id": h["edmo_id"], "raw": h["raw"], "status": "edmo",
                          "name_in_record": h["name_in_record"],
                          "ror_name": twin["name"] if twin else "",
                          "ror_match": twin["id"] if twin else "",
+                         "match_basis": m.get("basis", "") if twin else "",
+                         "ror_candidate": cand["id"] if cand else "",
                          "successors": [], "problem": problem, "advice": adv,
                          "lookup_failed": bool(m.get("error"))})
         return rows
@@ -539,8 +725,12 @@ def summary_line(rows, n_sources):
     s = "Checked %d ROR ID mentions (%d distinct) in %d source(s): %s." % (
         len(ror_rows), len({r["ror_id"] for r in ror_rows}), n_sources, ", ".join(parts))
     if edmo_rows:
-        s += " Also %d EDMO ID mention(s), %d with a ROR match." % (
+        s += " Also %d EDMO ID mention(s), %d with a ROR match" % (
             len(edmo_rows), sum(1 for r in edmo_rows if r.get("ror_match")))
+        n_rej = sum(1 for r in edmo_rows if r.get("ror_candidate"))
+        if n_rej:
+            s += ", %d with a rejected ROR candidate" % n_rej
+        s += "."
     return s
 
 
@@ -655,13 +845,16 @@ def main(argv=None, get=None, out=None):
                     "withdrawn ID that has exactly one successor replaced by it")
     ap.add_argument("--no-edmo", action="store_true",
                     help="do not look for EDMO affiliation IDs")
+    ap.add_argument("--edmo-vocab", default=ZENODO_AFF,
+                    help="InvenioRDM affiliations API used to look up an EDMO entry's "
+                         "country (default %(default)s; '' to skip the country check)")
     ap.add_argument("--all", action="store_true", help="also list active IDs")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--csv", action="store_true")
     ap.add_argument("--pause", type=float, default=0.1, help="seconds between requests")
     ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     a = ap.parse_args(argv)
-    checker = Checker(get=get, pause=a.pause)
+    checker = Checker(get=get, pause=a.pause, edmo_vocab=a.edmo_vocab)
 
     if a.withdrawn_list:
         wl = checker.list_withdrawn()

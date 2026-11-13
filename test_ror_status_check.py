@@ -75,6 +75,35 @@ INVENIO_REC = {"metadata": {
                  "award": {"id": "012345678"}}],
     "identifiers": [{"scheme": "ror", "identifier": "03wevmz93"}]}}
 
+# 0.2.1 fixtures, shaped like ROR API v2 and Zenodo answers read on 2026-11-13.
+NAT = {"id": "https://ror.org/04h6dxr28", "status": "active",
+       "names": [{"value": "Native American Technologies (United States)",
+                  "types": ["ror_display", "label"]}],
+       "locations": [{"geonames_details": {"country_code": "US"}}]}
+BSE = {"id": "https://ror.org/02k09n368", "status": "active",
+       "names": [{"value": "Barcelona School of Economics", "types": ["ror_display"]}],
+       "locations": [{"geonames_details": {"country_code": "ES"}}]}
+BARCA_NAME = "Barcelona Tech. Laboratory of Maritime Engineering"
+BARCA_MATCH = {"items": [{"chosen": True, "score": 1.0, "organization": NAT},
+                         {"chosen": False, "score": 0.88, "organization": BSE}]}
+FUGRO = {"id": "https://ror.org/00p77cm62", "status": "active",
+         "names": [{"value": "Fugro (United Kingdom)", "types": ["ror_display", "label"]},
+                   {"value": "Fugro GeoConsulting", "types": ["alias"]}],
+         "locations": [{"geonames_details": {"country_code": "GB", "name": "Wallingford"}}]}
+FUGRO_MATCH = {"items": [{"chosen": True, "score": 1.0, "organization": FUGRO}]}
+
+
+def nrc(rid, cc):
+    return {"id": "https://ror.org/" + rid, "status": "active",
+            "names": [{"value": "National Research Council",
+                       "types": ["ror_display", "label"]}],
+            "locations": [{"geonames_details": {"country_code": cc}}]}
+
+
+NRC_MATCH = {"items": [{"chosen": False, "score": 1.0, "organization": nrc("03bjn0010", "LK")},
+                       {"chosen": False, "score": 1.0, "organization": nrc("035rrps97", "RO")},
+                       {"chosen": False, "score": 1.0, "organization": nrc("04zaypm56", "IT")}]}
+
 
 def fake_get(table):
     """table: list of (url prefix or predicate, response or exception)."""
@@ -238,6 +267,137 @@ class TestMatch(unittest.TestCase):
         resp = {"items": [{"chosen": True, "organization": gone}]}
         c = rsc.Checker(get=fake_get([(rsc.ROR_API + "?affiliation=", resp)]), pause=0)
         self.assertIsNone(c.match_ror("The University of Texas at Austin")["match"])
+
+
+class TestEdmoChecks(unittest.TestCase):
+    """0.2.1: a suggested ROR record must share the name and the country."""
+
+    def test_name_ok(self):
+        ok = rsc.name_ok
+        self.assertTrue(ok("Fugro Geoconsulting Inc", ["Fugro (United Kingdom)"]))
+        self.assertFalse(ok(BARCA_NAME, ["Native American Technologies (United States)"]))
+        self.assertTrue(ok("MIT, Massachussets Institute of Technology, Boston",
+                           ["Massachusetts Institute of Technology"]))
+        self.assertTrue(ok("University of Glasgow School of Life Sciences",
+                           ["University of Glasgow"]))
+        self.assertFalse(ok("University of Bergen", ["University of Bremen"]))
+        self.assertTrue(ok("Universite de Bretagne Occidentale",
+                           ["Université de Bretagne Occidentale"]))
+        self.assertTrue(ok("MIT", ["Massachusetts Institute of Technology"], ["MIT"]))
+        self.assertFalse(ok("MIT Boston", ["Massachusetts Institute of Technology"],
+                            ["MIT"]))
+        self.assertFalse(ok("", ["Harvard University"]))
+        self.assertFalse(ok("Harvard University", []))
+
+    def test_ror_names_and_countries(self):
+        self.assertEqual(rsc.ror_names(FUGRO),
+                         (["Fugro (United Kingdom)", "Fugro GeoConsulting"], []))
+        self.assertEqual(rsc.ror_names(HMS), (["Harvard Medical School"], ["HMS"]))
+        self.assertEqual(rsc.ror_countries(FUGRO), {"GB"})
+        self.assertEqual(rsc.ror_countries({"country": {"country_code": "us"}}), {"US"})
+        self.assertEqual(rsc.ror_countries(UTA), set())
+
+    def test_chosen_rejected_by_name(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", BARCA_MATCH),
+                        (rsc.ZENODO_AFF + "edmo:340", {"id": "edmo:340", "country": "ES"})])
+        m = rsc.Checker(get=get, pause=0).match_ror(BARCA_NAME, "edmo:340")
+        self.assertIsNone(m["match"])
+        self.assertEqual((m["candidate"]["id"], m["reason"]), ("04h6dxr28", "name"))
+        p, a = rsc.advise_edmo(m)
+        self.assertFalse(p)
+        self.assertIn("shares too few words", a)
+
+    def test_chosen_rejected_by_country_and_cached(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", FUGRO_MATCH),
+                        (rsc.ZENODO_AFF + "edmo:3399", {"id": "edmo:3399", "country": "US"})])
+        c = rsc.Checker(get=get, pause=0)
+        m = c.match_ror("Fugro Geoconsulting Inc", "edmo:3399")
+        self.assertIsNone(m["match"])
+        self.assertEqual((m["candidate"]["id"], m["reason"], m["edmo_country"],
+                          m["ror_countries"]), ("00p77cm62", "country", "US", ["GB"]))
+        p, a = rsc.advise_edmo(m)
+        self.assertFalse(p)
+        self.assertIn("(Fugro (United Kingdom), GB)", a)
+        self.assertIn("this EDMO entry is in US", a)
+        c.match_ror("Fugro Geoconsulting Inc", "edmo:3399")
+        self.assertEqual(len(get.calls), 2)
+        self.assertEqual(get.calls[1], rsc.ZENODO_AFF + "edmo:3399")
+
+    def test_chosen_same_country_kept(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", FUGRO_MATCH),
+                        (rsc.ZENODO_AFF + "edmo:77", {"country": "gb"})])
+        m = rsc.Checker(get=get, pause=0).match_ror("Fugro Geoconsulting Inc", "edmo:77")
+        self.assertEqual((m["match"]["id"], m["basis"]), ("00p77cm62", "chosen"))
+
+    def test_same_country_fallback(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", NRC_MATCH),
+                        (rsc.ZENODO_AFF + "edmo:1367", {"country": "IT"})])
+        m = rsc.Checker(get=get, pause=0).match_ror("National Research Council",
+                                                     "edmo:1367")
+        self.assertEqual(m["match"], {"id": "04zaypm56", "name": "National Research Council"})
+        self.assertEqual((m["basis"], m["country"]), ("name+country", "IT"))
+        p, a = rsc.advise_edmo(m)
+        self.assertTrue(p)
+        self.assertIn("same country (IT): https://ror.org/04zaypm56", a)
+
+    def test_fallback_needs_country_and_uniqueness(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", NRC_MATCH)])
+        m = rsc.Checker(get=get, pause=0).match_ror("National Research Council",
+                                                     "edmo:1367")
+        self.assertEqual(m, {"match": None})
+        two = {"items": NRC_MATCH["items"] + [
+            {"chosen": False, "score": 1.0, "organization": nrc("01aaaaa00", "IT")}]}
+        get = fake_get([(rsc.ROR_API + "?affiliation=", two),
+                        (rsc.ZENODO_AFF + "edmo:1367", {"country": "IT"})])
+        m = rsc.Checker(get=get, pause=0).match_ror("National Research Council",
+                                                     "edmo:1367")
+        self.assertIsNone(m["match"])
+
+    def test_no_vocab_no_country_call(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", NRC_MATCH)])
+        c = rsc.Checker(get=get, pause=0, edmo_vocab="")
+        self.assertIsNone(c.match_ror("National Research Council", "edmo:1367")["match"])
+        self.assertFalse(any("zenodo" in u for u in get.calls))
+
+    def test_country_lookup_error_is_ignored(self):
+        get = fake_get([(rsc.ROR_API + "?affiliation=", FUGRO_MATCH),
+                        (rsc.ZENODO_AFF, RuntimeError("down"))])
+        m = rsc.Checker(get=get, pause=0).match_ror("Fugro Geoconsulting Inc", "edmo:3399")
+        self.assertEqual(m["basis"], "chosen")
+
+    def file_run(self, rec, table, extra=()):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "rec.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(rec, f)
+            out = io.StringIO()
+            code = rsc.main([p, "--pause", "0"] + list(extra), get=fake_get(table),
+                            out=out)
+        return code, out.getvalue()
+
+    def test_main_rejected_candidate_csv(self):
+        rec = {"affiliations": [{"id": "edmo:340", "name": BARCA_NAME}]}
+        table = [(rsc.ROR_API + "?affiliation=", BARCA_MATCH),
+                 (rsc.ZENODO_AFF + "edmo:340", {"country": "ES"})]
+        code, s = self.file_run(rec, table, ["--csv"])
+        self.assertEqual(code, 0)
+        rows = list(csv.DictReader(io.StringIO(s)))
+        self.assertEqual((rows[0]["edmo_id"], rows[0]["ror_match"],
+                          rows[0]["ror_candidate"], rows[0]["problem"]),
+                         ("edmo:340", "", "04h6dxr28", "False"))
+        code, s = self.file_run(rec, table)
+        self.assertIn("Also 1 EDMO ID mention(s), 0 with a ROR match, "
+                      "1 with a rejected ROR candidate.", s)
+
+    def test_main_same_country_match(self):
+        rec = {"affiliations": [{"id": "edmo:1367", "name": "National Research Council"}]}
+        table = [(rsc.ROR_API + "?affiliation=", NRC_MATCH),
+                 (rsc.ZENODO_AFF + "edmo:1367", {"country": "IT"})]
+        code, s = self.file_run(rec, table, ["--csv"])
+        self.assertEqual(code, 1)
+        rows = list(csv.DictReader(io.StringIO(s)))
+        self.assertEqual((rows[0]["ror_match"], rows[0]["match_basis"]),
+                         ("04zaypm56", "name+country"))
 
 
 class TestMain(unittest.TestCase):

@@ -41,6 +41,15 @@ DataCite); in 2026 a search by ROR ID misses 45% of the Zenodo DOIs that identif
 University by ID and 50% of Caltech's. Details, numbers and how to check them:
 [FINDINGS-EDMO-1.md](FINDINGS-EDMO-1.md).
 
+**Checked EDMO suggestions (new in 0.2.1).** ROR's affiliation matcher goes by name alone.
+In a 10-entry pilot it chose a US company for "Barcelona Tech. Laboratory of Maritime
+Engineering" and a UK company for a US Fugro office, and for Italy's "National Research
+Council" (CNR, edmo:1367) it chose nothing, because several countries have a council of
+that name. 0.2.1 checks names and countries before suggesting anything:
+[FINDINGS-EDMO-2.md](FINDINGS-EDMO-2.md). A pre-registered census of all 5,258 EDMO
+entries in Zenodo's vocabulary is in [PREREG-EDMO-1.md](PREREG-EDMO-1.md) (`edmo_census.py`;
+results pending).
+
 A pre-registered census of every withdrawn ID across Crossref and DataCite is in
 [withdrawn-ror-census](https://github.com/munimtechnologies/withdrawn-ror-census)
 (PREREG-ROR-1; results pending). We found no existing tool that checks DOI metadata for
@@ -57,6 +66,7 @@ python ror_status_check.py --datacite-client cern.zenodo      # whole DataCite r
 python ror_status_check.py --crossref-member 4374             # whole Crossref member
 python ror_status_check.py --withdrawn-list > withdrawn.csv   # every withdrawn ID and its successor
 python ror_status_check.py --no-edmo record.json              # ROR checks only
+python ror_status_check.py --edmo-vocab "" record.json        # EDMO checks without the country lookup
 ```
 
 Example (DOI with one withdrawn ROR affiliation and one EDMO twin; active IDs are hidden
@@ -85,34 +95,59 @@ What it reports for each ID:
 | `unknown` | ROR API returns 404 | check for a typo |
 | `malformed` | format or checksum fails (checked offline) | check for a typo |
 | `active` | fine | nothing |
-| `edmo` | EDMO ID (`edmo:N` or an `edmo.seadatanet.org/report/N` link) | if ROR's matcher confidently matches the name next to it (`ror_match`), consider the ROR ID |
+| `edmo` | EDMO ID (`edmo:N` or an `edmo.seadatanet.org/report/N` link) | if a checked ROR record exists (`ror_match`), consider the ROR ID |
+
+How an EDMO ID gets a `ror_match` (0.2.1):
+
+1. ROR's matcher (`?affiliation=` with the name stored next to the EDMO ID) `chosen`, active
+   record, if it passes the **name check** (at least 60% of the words of one of its names,
+   ignoring "of", "the", "de" and the like, accents and parenthesised text such as
+   "(United Kingdom)", appear in the stored name) and the **country check** (same country
+   as the EDMO entry in Zenodo's vocabulary, `zenodo.org/api/affiliations/edmo:N`, when
+   both are known). `match_basis` = `chosen`.
+2. Otherwise the only active record that scored at least 0.9, passes the name check and is
+   in the EDMO entry's country. `match_basis` = `name+country`.
+3. Otherwise no match. A `chosen` record that failed a check is shown as `ror_candidate`,
+   with the reason, and is not counted as a problem.
 
 Exit code: 1 if any withdrawn, unknown or malformed ROR ID, or any EDMO ID with a ROR
 match, is found (useful in CI); 2 if a lookup failed; otherwise 0. `--json` and `--csv`
-give structured output (CSV columns `edmo_id` and `ror_match` were added in 0.2.0).
+give structured output (CSV columns `edmo_id` and `ror_match` were added in 0.2.0,
+`match_basis` and `ror_candidate` in 0.2.1).
 
 How IDs are found: any `ror.org/0...` link anywhere in the record or file; bare IDs such
 as `03wevmz92` when the same object says the scheme is ROR, or when they sit under an
 `id`-like key on an affiliation or funder path and pass ROR's checksum (InvenioRDM
 records). ROR's checksum (two digits, ISO 7064 Mod 97-10 over the six base-32 characters)
-is checked offline before any lookup. EDMO IDs are matched by name only through ROR's
-`?affiliation=` matcher, using the name stored in the same object (never a person's
-name); only a `chosen`, active ROR record is suggested.
+is checked offline before any lookup. EDMO IDs are matched using the name stored in the
+same object (never a person's name).
 
 `--fix-to` only replaces a withdrawn ID that has exactly one successor, as a whole token,
 and leaves organisation names as they are; review the result before depositing it. It
 never changes EDMO IDs (that needs a scheme change and a human check).
 
+## EDMO census
+
+`edmo_census.py` (pre-registered in [PREREG-EDMO-1.md](PREREG-EDMO-1.md)) lists every
+EDMO entry in an InvenioRDM vocabulary (Zenodo's by default), runs the 0.2.1 matching on
+each, and counts the DataCite DOIs that carry each EDMO ID (and, for matched entries, those
+without the matched ROR ID):
+
+```
+python edmo_census.py --out-dir out/      # vocab.jsonl, census.csv, summary.json, hand_sample.csv
+```
+
 ## Limits
 
-- One ROR API request per distinct ID or EDMO name (cached), one Crossref and/or
-  DataCite request per DOI, and one request per withdrawn ROR record (about 1,450) for a
-  repository scan, plus one for the EDMO count. It is read-only and identifies itself
-  with a `mailto`.
+- One ROR API request per distinct ID or EDMO name, and one Zenodo vocabulary request per
+  distinct EDMO ID (both cached), one Crossref and/or DataCite request per DOI, and one
+  request per withdrawn ROR record (about 1,450) for a repository scan, plus one for the
+  EDMO count. It is read-only and identifies itself with a `mailto`.
 - A repository scan uses DataCite's search on creator and contributor affiliations and
   funder identifiers, and Crossref's `ror-id` filter; it lists up to `--examples` DOIs per ID.
-- ROR's matcher goes by name: a suggested `ror_match` can be wrong when two
-  organisations share a name. Check it.
+- The name and country checks are simple rules, tested on a handful of real cases
+  (FINDINGS-EDMO-2). A suggested `ror_match` can still be wrong, for example a parent
+  university for a department, or a namesake in the same country. Check it.
 - Whether to change already-registered DOIs is the depositor's call; ROR only advises it.
 
 ## Agent skill
